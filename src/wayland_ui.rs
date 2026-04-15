@@ -1,3 +1,4 @@
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
@@ -8,12 +9,14 @@ use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::constants::{
-    BAR_HEIGHT, BAR_HIDDEN_RGBA, BAR_VISIBLE_RGBA, MARGIN_SIDE, MARGIN_TOP, SIGNAL_HIDE,
-    SIGNAL_SHOW, SLOW_REFRESH_MS, TEXT_RGBA, WORKSPACE_REFRESH_MS,
+    BAR_HEIGHT, BAR_HIDDEN_RGBA, BAR_VISIBLE_RGBA, BATTERY_REFRESH_MS, DATETIME_REFRESH_HIDDEN_MS,
+    DATETIME_REFRESH_VISIBLE_MS, LOOP_SLEEP_HIDDEN_MS, LOOP_SLEEP_VISIBLE_MS, MARGIN_SIDE,
+    MARGIN_TOP, SIGNAL_HIDE, SIGNAL_SHOW, TEXT_RGBA, VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS,
+    WORKSPACE_POLL_HIDDEN_MS, WORKSPACE_POLL_VISIBLE_MS,
 };
 use crate::renderer::{self, ShmBarBuffer};
 use crate::signals;
-use crate::status::BarStatus;
+use crate::status::{self, BarStatus, StatusEvent, StatusEventStreams};
 
 pub fn run_wayland_bar() -> Result<(), String> {
     signals::register_signal_handlers();
@@ -55,7 +58,8 @@ pub fn run_wayland_bar() -> Result<(), String> {
 
     surface.commit();
 
-    let mut state = AppState::new(surface, layer_surface, shm, qh);
+    let streams = status::spawn_status_event_streams();
+    let mut state = AppState::new(surface, layer_surface, shm, qh, streams);
 
     while !state.configured && !state.closed {
         event_queue
@@ -89,15 +93,20 @@ pub fn run_wayland_bar() -> Result<(), String> {
             break;
         }
 
+        state.tick_status();
+
         if state.needs_redraw {
             state.redraw();
             state.needs_redraw = false;
         }
 
-        state.tick_status();
-
         let _ = conn.flush();
-        std::thread::sleep(Duration::from_millis(8));
+        let sleep_ms = if state.visible {
+            LOOP_SLEEP_VISIBLE_MS
+        } else {
+            LOOP_SLEEP_HIDDEN_MS
+        };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     Ok(())
@@ -114,8 +123,12 @@ struct AppState {
     closed: bool,
     visible: bool,
     needs_redraw: bool,
-    last_workspace_refresh: Instant,
-    last_slow_refresh: Instant,
+    last_workspace_poll: Instant,
+    last_volume_poll: Instant,
+    last_battery_refresh: Instant,
+    last_datetime_refresh: Instant,
+    status_events: Receiver<StatusEvent>,
+    workspace_event_driven: bool,
     status: BarStatus,
     visible_buffer: Option<ShmBarBuffer>,
     hidden_buffer: Option<ShmBarBuffer>,
@@ -127,6 +140,7 @@ impl AppState {
         layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         shm: wl_shm::WlShm,
         qh: QueueHandle<Self>,
+        streams: StatusEventStreams,
     ) -> Self {
         Self {
             surface,
@@ -139,8 +153,13 @@ impl AppState {
             closed: false,
             visible: false,
             needs_redraw: false,
-            last_workspace_refresh: Instant::now() - Duration::from_millis(WORKSPACE_REFRESH_MS),
-            last_slow_refresh: Instant::now() - Duration::from_millis(SLOW_REFRESH_MS),
+            last_workspace_poll: Instant::now() - Duration::from_millis(WORKSPACE_POLL_HIDDEN_MS),
+            last_volume_poll: Instant::now() - Duration::from_millis(VOLUME_POLL_HIDDEN_MS),
+            last_battery_refresh: Instant::now() - Duration::from_millis(BATTERY_REFRESH_MS),
+            last_datetime_refresh: Instant::now()
+                - Duration::from_millis(DATETIME_REFRESH_HIDDEN_MS),
+            status_events: streams.rx,
+            workspace_event_driven: streams.workspace_event_driven,
             status: BarStatus::gather(),
             visible_buffer: None,
             hidden_buffer: None,
@@ -150,30 +169,78 @@ impl AppState {
     fn tick_status(&mut self) {
         let now = Instant::now();
         let mut changed = false;
+        let mut workspace_dirty = false;
+        let workspace_poll_ms = if self.visible {
+            WORKSPACE_POLL_VISIBLE_MS
+        } else {
+            WORKSPACE_POLL_HIDDEN_MS
+        };
+        let volume_poll_ms = if self.visible {
+            VOLUME_POLL_VISIBLE_MS
+        } else {
+            VOLUME_POLL_HIDDEN_MS
+        };
+        let datetime_refresh_ms = if self.visible {
+            DATETIME_REFRESH_VISIBLE_MS
+        } else {
+            DATETIME_REFRESH_HIDDEN_MS
+        };
 
-        if now.duration_since(self.last_workspace_refresh)
-            >= Duration::from_millis(WORKSPACE_REFRESH_MS)
+        while let Ok(event) = self.status_events.try_recv() {
+            match event {
+                StatusEvent::WorkspaceDirty => workspace_dirty = true,
+            }
+        }
+
+        if workspace_dirty {
+            let next_workspaces = BarStatus::gather_workspaces();
+            if self.status.workspaces != next_workspaces {
+                self.status.workspaces = next_workspaces;
+                changed = true;
+            }
+        }
+
+        if !self.workspace_event_driven
+            && now.duration_since(self.last_workspace_poll)
+                >= Duration::from_millis(workspace_poll_ms)
         {
             let next_workspaces = BarStatus::gather_workspaces();
             if self.status.workspaces != next_workspaces {
                 self.status.workspaces = next_workspaces;
                 changed = true;
             }
-            self.last_workspace_refresh = now;
+            self.last_workspace_poll = now;
         }
 
-        if now.duration_since(self.last_slow_refresh) >= Duration::from_millis(SLOW_REFRESH_MS) {
-            let (next_battery, next_volume, next_datetime) = BarStatus::gather_slow();
-            if self.status.battery != next_battery
-                || self.status.volume != next_volume
-                || self.status.datetime != next_datetime
-            {
-                self.status.battery = next_battery;
+        if now.duration_since(self.last_volume_poll) >= Duration::from_millis(volume_poll_ms) {
+            let next_volume = status::gather_volume();
+            if self.status.volume != next_volume {
                 self.status.volume = next_volume;
+                changed = true;
+            }
+            self.last_volume_poll = now;
+        }
+
+        if now.duration_since(self.last_battery_refresh)
+            >= Duration::from_millis(BATTERY_REFRESH_MS)
+        {
+            let next_battery = status::gather_battery();
+            if self.status.battery != next_battery {
+                self.status.battery = next_battery;
+                changed = true;
+            }
+            self.last_battery_refresh = now;
+        }
+
+        if now.duration_since(self.last_datetime_refresh)
+            >= Duration::from_millis(datetime_refresh_ms)
+        {
+            let next_datetime = status::gather_datetime();
+            if self.status.datetime != next_datetime {
                 self.status.datetime = next_datetime;
                 changed = true;
             }
-            self.last_slow_refresh = now;
+            self.last_datetime_refresh = now;
         }
 
         if changed {

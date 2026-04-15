@@ -1,6 +1,11 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
+use std::time::Duration;
 
 pub struct BarStatus {
     pub workspaces: String,
@@ -9,13 +14,23 @@ pub struct BarStatus {
     pub datetime: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum StatusEvent {
+    WorkspaceDirty,
+}
+
+pub struct StatusEventStreams {
+    pub rx: Receiver<StatusEvent>,
+    pub workspace_event_driven: bool,
+}
+
 impl BarStatus {
     pub fn gather() -> Self {
         Self {
             workspaces: format_workspaces(),
-            battery: format_battery(),
-            volume: format_volume(),
-            datetime: format_datetime(),
+            battery: gather_battery(),
+            volume: gather_volume(),
+            datetime: gather_datetime(),
         }
     }
 
@@ -23,9 +38,100 @@ impl BarStatus {
         format_workspaces()
     }
 
-    pub fn gather_slow() -> (String, String, String) {
-        (format_battery(), format_volume(), format_datetime())
+}
+
+pub fn gather_battery() -> String {
+    format_battery()
+}
+
+pub fn gather_volume() -> String {
+    format_volume()
+}
+
+pub fn gather_datetime() -> String {
+    format_datetime()
+}
+
+pub fn spawn_status_event_streams() -> StatusEventStreams {
+    const STATUS_EVENT_BUFFER: usize = 32;
+    let (tx, rx) = mpsc::sync_channel(STATUS_EVENT_BUFFER);
+
+    let workspace_event_driven = spawn_workspace_listener(tx);
+
+    StatusEventStreams {
+        rx,
+        workspace_event_driven,
     }
+}
+
+fn spawn_workspace_listener(tx: SyncSender<StatusEvent>) -> bool {
+    let Some(sig) = hyprland_signature() else {
+        return false;
+    };
+    let Some(socket_path) = hyprland_event_socket_path(&sig) else {
+        return false;
+    };
+
+    thread::spawn(move || {
+        loop {
+            let Ok(stream) = UnixStream::connect(&socket_path) else {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            };
+
+            let reader = BufReader::new(stream);
+            for line in reader.lines().map_while(Result::ok) {
+                if !is_workspace_event(&line) {
+                    continue;
+                }
+                send_dirty_event(&tx, StatusEvent::WorkspaceDirty);
+            }
+
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+
+    true
+}
+
+fn hyprland_signature() -> Option<String> {
+    std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .filter(|sig| !sig.is_empty())
+        .or_else(discover_hyprland_signature)
+}
+
+fn hyprland_event_socket_path(sig: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime).join("hypr").join(sig).join(".socket2.sock"));
+    }
+    candidates.push(PathBuf::from("/tmp/hypr").join(sig).join(".socket2.sock"));
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn is_workspace_event(line: &str) -> bool {
+    let Some((kind, _)) = line.split_once(">>") else {
+        return false;
+    };
+    matches!(
+        kind,
+        "workspace"
+            | "workspacev2"
+            | "focusedmon"
+            | "focusedmonv2"
+            | "createworkspace"
+            | "createworkspacev2"
+            | "destroyworkspace"
+            | "destroyworkspacev2"
+            | "moveworkspace"
+            | "moveworkspacev2"
+            | "renameworkspace"
+    )
+}
+
+fn send_dirty_event(tx: &SyncSender<StatusEvent>, event: StatusEvent) {
+    let _ = tx.try_send(event);
 }
 
 fn format_workspaces() -> String {
@@ -74,9 +180,42 @@ fn format_volume() -> String {
 }
 
 fn format_datetime() -> String {
-    run_cmd("date", &["+%a %d %b %H:%M"])
-        .map(|s| s.trim().to_ascii_uppercase())
-        .unwrap_or_else(|| "-- -- --- --:--".to_string())
+    const FALLBACK: &str = "-- -- --- --:--";
+
+    let mut now: libc::time_t = 0;
+    // SAFETY: libc::time writes current time into valid pointer.
+    unsafe {
+        libc::time(&mut now as *mut libc::time_t);
+    }
+
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: localtime_r initializes tm when non-null returned.
+    let ok = unsafe { !libc::localtime_r(&now as *const libc::time_t, tm.as_mut_ptr()).is_null() };
+    if !ok {
+        return FALLBACK.to_string();
+    }
+
+    // SAFETY: initialized by localtime_r check above.
+    let tm = unsafe { tm.assume_init() };
+    let mut out = [0_u8; 64];
+    let fmt = b"%a %d %b %H:%M\0";
+
+    // SAFETY: all pointers valid, fmt null-terminated.
+    let written = unsafe {
+        libc::strftime(
+            out.as_mut_ptr() as *mut libc::c_char,
+            out.len(),
+            fmt.as_ptr() as *const libc::c_char,
+            &tm as *const libc::tm,
+        )
+    };
+    if written == 0 {
+        return FALLBACK.to_string();
+    }
+
+    std::str::from_utf8(&out[..written])
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|_| FALLBACK.to_string())
 }
 
 fn run_cmd(bin: &str, args: &[&str]) -> Option<String> {
@@ -246,10 +385,7 @@ fn parse_i64_from(s: &str, mut i: usize) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_battery_charging, is_volume_muted, parse_i64_from, parse_volume_percent,
-        parse_workspace_ids,
-    };
+    use super::{is_battery_charging, is_volume_muted, parse_i64_from, parse_volume_percent, parse_workspace_ids};
 
     #[test]
     fn parse_i64_from_reads_positive_and_negative() {
@@ -299,4 +435,5 @@ mod tests {
         assert!(!is_battery_charging("Discharging"));
         assert!(!is_battery_charging("Full"));
     }
+
 }

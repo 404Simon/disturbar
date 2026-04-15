@@ -3,10 +3,17 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 
 use tempfile::tempfile;
-use wayland_client::QueueHandle;
 use wayland_client::protocol::{wl_buffer, wl_shm};
+use wayland_client::QueueHandle;
 
 const GLYPH_SCALE: i32 = 2;
+
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
 
 pub struct ShmBarBuffer {
     #[allow(dead_code)]
@@ -29,10 +36,12 @@ pub fn render_visible_pixels(
         &mut pixels,
         width,
         height,
-        0,
-        0,
-        width as i32,
-        height as i32,
+        Rect {
+            x: 0,
+            y: 0,
+            w: width as i32,
+            h: height as i32,
+        },
         background,
     );
 
@@ -123,20 +132,11 @@ where
     Some(ShmBarBuffer { file, buffer })
 }
 
-fn fill_rect(
-    pixels: &mut [u8],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    rgba: [u8; 4],
-) {
-    let x0 = x.max(0).min(width as i32);
-    let y0 = y.max(0).min(height as i32);
-    let x1 = (x + w).max(0).min(width as i32);
-    let y1 = (y + h).max(0).min(height as i32);
+fn fill_rect(pixels: &mut [u8], width: u32, height: u32, rect: Rect, rgba: [u8; 4]) {
+    let x0 = rect.x.max(0).min(width as i32);
+    let y0 = rect.y.max(0).min(height as i32);
+    let x1 = (rect.x + rect.w).max(0).min(width as i32);
+    let y1 = (rect.y + rect.h).max(0).min(height as i32);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
@@ -198,10 +198,12 @@ fn draw_glyph(pixels: &mut [u8], width: u32, height: u32, x: i32, y: i32, ch: ch
                 pixels,
                 width,
                 height,
-                x + rx * GLYPH_SCALE,
-                y + ry as i32 * GLYPH_SCALE,
-                GLYPH_SCALE,
-                GLYPH_SCALE,
+                Rect {
+                    x: x + rx * GLYPH_SCALE,
+                    y: y + ry as i32 * GLYPH_SCALE,
+                    w: GLYPH_SCALE,
+                    h: GLYPH_SCALE,
+                },
                 rgba,
             );
         }
