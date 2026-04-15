@@ -1,0 +1,13 @@
+[Unit]
+Description=disturbar input backend (Super hold listener)
+After=multi-user.target
+Before=disturbar-ui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/disturbar --input-backend
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

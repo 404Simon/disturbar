@@ -1,0 +1,17 @@
+[Unit]
+Description=disturbar UI
+After=graphical.target
+
+[Service]
+Type=simple
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+EnvironmentFile=-/etc/default/disturbar
+ExecStart=/usr/local/bin/disturbar
+Restart=on-failure
+RestartSec=1
+User=simon
+Group=simon
+
+[Install]
+WantedBy=graphical.target

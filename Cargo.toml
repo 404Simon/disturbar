@@ -1,0 +1,13 @@
+[package]
+name = "disturbar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+input = "0.10"
+nix = { version = "0.31", features = ["poll"] }
+evdev-rs = "0.6.2"
+tempfile = "3.23"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
