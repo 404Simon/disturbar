@@ -18,6 +18,14 @@ impl BarStatus {
             datetime: format_datetime(),
         }
     }
+
+    pub fn gather_workspaces() -> String {
+        format_workspaces()
+    }
+
+    pub fn gather_slow() -> (String, String, String) {
+        (format_battery(), format_volume(), format_datetime())
+    }
 }
 
 fn format_workspaces() -> String {

@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
+use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::constants::{
@@ -74,7 +74,6 @@ pub fn run_wayland_bar() -> Result<(), String> {
     loop {
         let signal = signals::take_visibility_signal();
         if signal == SIGNAL_SHOW && !state.visible {
-            state.refresh_status_now();
             state.visible = true;
             state.needs_redraw = true;
         } else if signal == SIGNAL_HIDE && state.visible {
@@ -90,12 +89,12 @@ pub fn run_wayland_bar() -> Result<(), String> {
             break;
         }
 
-        state.tick_status();
-
         if state.needs_redraw {
             state.redraw();
             state.needs_redraw = false;
         }
+
+        state.tick_status();
 
         let _ = conn.flush();
         std::thread::sleep(Duration::from_millis(8));
@@ -155,7 +154,7 @@ impl AppState {
         if now.duration_since(self.last_workspace_refresh)
             >= Duration::from_millis(WORKSPACE_REFRESH_MS)
         {
-            let next_workspaces = BarStatus::gather().workspaces;
+            let next_workspaces = BarStatus::gather_workspaces();
             if self.status.workspaces != next_workspaces {
                 self.status.workspaces = next_workspaces;
                 changed = true;
@@ -164,14 +163,14 @@ impl AppState {
         }
 
         if now.duration_since(self.last_slow_refresh) >= Duration::from_millis(SLOW_REFRESH_MS) {
-            let next = BarStatus::gather();
-            if self.status.battery != next.battery
-                || self.status.volume != next.volume
-                || self.status.datetime != next.datetime
+            let (next_battery, next_volume, next_datetime) = BarStatus::gather_slow();
+            if self.status.battery != next_battery
+                || self.status.volume != next_volume
+                || self.status.datetime != next_datetime
             {
-                self.status.battery = next.battery;
-                self.status.volume = next.volume;
-                self.status.datetime = next.datetime;
+                self.status.battery = next_battery;
+                self.status.volume = next_volume;
+                self.status.datetime = next_datetime;
                 changed = true;
             }
             self.last_slow_refresh = now;
@@ -182,23 +181,6 @@ impl AppState {
             if self.visible {
                 self.needs_redraw = true;
             }
-        }
-    }
-
-    fn refresh_status_now(&mut self) {
-        let next = BarStatus::gather();
-
-        let changed = self.status.workspaces != next.workspaces
-            || self.status.battery != next.battery
-            || self.status.volume != next.volume
-            || self.status.datetime != next.datetime;
-
-        self.status = next;
-        self.last_workspace_refresh = Instant::now() - Duration::from_millis(WORKSPACE_REFRESH_MS);
-        self.last_slow_refresh = Instant::now() - Duration::from_millis(SLOW_REFRESH_MS);
-
-        if changed {
-            self.recreate_buffers();
         }
     }
 
