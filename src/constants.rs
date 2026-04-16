@@ -21,3 +21,5 @@ pub const LOOP_SLEEP_HIDDEN_MS: u64 = 40;
 pub const SIGNAL_NONE: u8 = 0;
 pub const SIGNAL_SHOW: u8 = 1;
 pub const SIGNAL_HIDE: u8 = 2;
+pub const SIGNAL_DETAIL_ON: u8 = 4;
+pub const SIGNAL_DETAIL_OFF: u8 = 8;

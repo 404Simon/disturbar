@@ -26,12 +26,12 @@ pub struct StatusEventStreams {
 }
 
 impl BarStatus {
-    pub fn gather() -> Self {
+    pub fn gather(detail_mode: bool) -> Self {
         Self {
             workspaces: format_workspaces(),
             song: gather_song(),
-            battery: gather_battery(),
-            volume: gather_volume(),
+            battery: gather_battery(detail_mode),
+            volume: gather_volume(detail_mode),
             datetime: gather_datetime(),
         }
     }
@@ -41,16 +41,16 @@ impl BarStatus {
     }
 }
 
-pub fn gather_battery() -> String {
-    format_battery()
+pub fn gather_battery(detail_mode: bool) -> String {
+    format_battery(detail_mode)
 }
 
 pub fn gather_song() -> String {
     format_song()
 }
 
-pub fn gather_volume() -> String {
-    format_volume()
+pub fn gather_volume(detail_mode: bool) -> String {
+    format_volume(detail_mode)
 }
 
 pub fn gather_datetime() -> String {
@@ -170,8 +170,15 @@ fn format_workspaces() -> String {
         .join(" ")
 }
 
-fn format_battery() -> String {
-    let (value, charging) = read_battery_state().unwrap_or_else(|| ("--".to_string(), false));
+fn format_battery(detail_mode: bool) -> String {
+    let state = read_battery_state();
+    if detail_mode {
+        return format_battery_time(state.as_ref());
+    }
+
+    let (value, charging) = state
+        .map(|state| (state.capacity, state.charging))
+        .unwrap_or_else(|| ("--".to_string(), false));
     if charging {
         format!("BAT CH {value}%")
     } else {
@@ -200,8 +207,13 @@ fn format_song() -> String {
     label.trim().to_string()
 }
 
-fn format_volume() -> String {
+fn format_volume(detail_mode: bool) -> String {
     let raw = run_cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).unwrap_or_default();
+
+    if detail_mode {
+        return format_volume_device(&raw);
+    }
+
     let value = parse_volume_percent(&raw).unwrap_or_else(|| "--".to_string());
     if is_volume_muted(&raw) {
         format!("VOL MUT {value}%")
@@ -323,7 +335,15 @@ fn discover_hyprland_signature() -> Option<String> {
     newest.map(|(_, sig)| sig)
 }
 
-fn read_battery_state() -> Option<(String, bool)> {
+struct BatteryState {
+    capacity: String,
+    charging: bool,
+    energy_now: Option<f64>,
+    energy_full: Option<f64>,
+    power_now: Option<f64>,
+}
+
+fn read_battery_state() -> Option<BatteryState> {
     let entries = fs::read_dir("/sys/class/power_supply").ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -348,9 +368,89 @@ fn read_battery_state() -> Option<(String, bool)> {
             .ok()
             .is_some_and(|status| is_battery_charging(&status));
 
-        return Some((capacity, charging));
+        return Some(BatteryState {
+            capacity,
+            charging,
+            energy_now: read_battery_metric(&base, &["energy_now", "charge_now"]),
+            energy_full: read_battery_metric(&base, &["energy_full", "charge_full"]),
+            power_now: read_battery_metric(&base, &["power_now", "current_now"]),
+        });
     }
     None
+}
+
+fn read_battery_metric(base: &PathBuf, names: &[&str]) -> Option<f64> {
+    for name in names {
+        let Ok(raw) = fs::read_to_string(base.join(name)) else {
+            continue;
+        };
+        let Ok(value) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        if value > 0.0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn format_battery_time(state: Option<&BatteryState>) -> String {
+    let Some(state) = state else {
+        return "BAT --:--".to_string();
+    };
+
+    let Some(power_now) = state.power_now else {
+        return battery_time_fallback_label(state.charging);
+    };
+
+    if power_now <= 0.0 {
+        return battery_time_fallback_label(state.charging);
+    }
+
+    let hours = if state.charging {
+        let Some(energy_full) = state.energy_full else {
+            return battery_time_fallback_label(true);
+        };
+        let Some(energy_now) = state.energy_now else {
+            return battery_time_fallback_label(true);
+        };
+        ((energy_full - energy_now).max(0.0)) / power_now
+    } else {
+        let Some(energy_now) = state.energy_now else {
+            return battery_time_fallback_label(false);
+        };
+        energy_now / power_now
+    };
+
+    let total_minutes = (hours * 60.0).floor() as i64;
+    let hh = (total_minutes / 60).max(0);
+    let mm = (total_minutes % 60).max(0);
+    if state.charging {
+        format!("BAT CH {hh:02}:{mm:02}")
+    } else {
+        format!("BAT {hh:02}:{mm:02}")
+    }
+}
+
+fn battery_time_fallback_label(charging: bool) -> String {
+    if charging {
+        "BAT CH --:--".to_string()
+    } else {
+        "BAT --:--".to_string()
+    }
+}
+
+fn format_volume_device(volume_raw: &str) -> String {
+    let raw = run_cmd("wpctl", &["inspect", "@DEFAULT_AUDIO_SINK@"]).unwrap_or_default();
+    let label = parse_wpctl_device_name(&raw)
+        .map(|name| format_volume_device_label(&sanitize_bar_text(&name)))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "--".to_string());
+    if is_volume_muted(volume_raw) {
+        format!("VOL MUT {label}")
+    } else {
+        format!("VOL {label}")
+    }
 }
 
 fn parse_volume_percent(output: &str) -> Option<String> {
@@ -370,6 +470,44 @@ fn is_volume_muted(output: &str) -> bool {
 
 fn is_battery_charging(status: &str) -> bool {
     status.trim().eq_ignore_ascii_case("charging")
+}
+
+fn parse_wpctl_device_name(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        for key in ["node.description", "device.description", "device.nick", "node.nick"] {
+            let marker = format!("{key} = \"");
+            if let Some(start) = trimmed.find(&marker) {
+                let value = &trimmed[start + marker.len()..];
+                if let Some(end) = value.find('"') {
+                    return Some(value[..end].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_volume_device_label(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("airpods") {
+        return "Pods".to_string();
+    }
+
+    if lower.contains("speaker")
+        || lower.contains("built-in")
+        || lower.contains("built in")
+        || lower.contains("analog stereo")
+    {
+        return "SPEAKER".to_string();
+    }
+
+    trimmed.chars().take(8).collect()
 }
 
 fn parse_json_i64_field(raw: &str, field: &str) -> Option<i64> {
@@ -490,9 +628,12 @@ fn parse_i64_from(s: &str, mut i: usize) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        find_json_string_field, is_battery_charging, is_volume_muted, parse_i64_from,
-        parse_volume_percent, parse_workspace_ids, sanitize_bar_text, song_title_from_file,
+        find_json_string_field, format_volume_device_label, is_battery_charging, is_volume_muted,
+        parse_i64_from, parse_volume_percent, parse_workspace_ids, parse_wpctl_device_name,
+        read_battery_metric, sanitize_bar_text, song_title_from_file,
     };
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_i64_from_reads_positive_and_negative() {
@@ -570,6 +711,44 @@ mod tests {
         assert_eq!(
             sanitize_bar_text("M83 _ Midnight City (Live)!"),
             "M83 Midnight City Live"
+        );
+    }
+
+    #[test]
+    fn parse_wpctl_device_name_reads_description() {
+        let raw = r#"
+id 48, type PipeWire:Interface:Node
+    node.description = "USB Headset"
+"#;
+        assert_eq!(parse_wpctl_device_name(raw), Some("USB Headset".to_string()));
+    }
+
+    #[test]
+    fn format_volume_device_label_aliases_airpods() {
+        assert_eq!(format_volume_device_label("AirPods Pro"), "Pods");
+    }
+
+    #[test]
+    fn format_volume_device_label_aliases_speakers() {
+        assert_eq!(
+            format_volume_device_label("Built-in Audio Analog Stereo"),
+            "SPEAKER"
+        );
+    }
+
+    #[test]
+    fn format_volume_device_label_truncates_unknown_names() {
+        assert_eq!(format_volume_device_label("USB Headset"), "USB Head");
+    }
+
+    #[test]
+    fn read_battery_metric_tries_later_fallback_files() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("current_now"), "750000\n").unwrap();
+
+        assert_eq!(
+            read_battery_metric(&dir.path().to_path_buf(), &["power_now", "current_now"]),
+            Some(750000.0)
         );
     }
 }

@@ -13,7 +13,7 @@ use crate::constants::{
     DATETIME_REFRESH_VISIBLE_MS, LOOP_SLEEP_HIDDEN_MS, LOOP_SLEEP_VISIBLE_MS, MARGIN_SIDE,
     MARGIN_TOP, SIGNAL_HIDE, SIGNAL_SHOW, SONG_POLL_HIDDEN_MS, SONG_POLL_VISIBLE_MS, TEXT_RGBA,
     VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS, WORKSPACE_POLL_HIDDEN_MS,
-    WORKSPACE_POLL_VISIBLE_MS,
+    WORKSPACE_POLL_VISIBLE_MS, SIGNAL_DETAIL_OFF, SIGNAL_DETAIL_ON,
 };
 use crate::renderer::{self, ShmBarBuffer};
 use crate::signals;
@@ -78,12 +78,21 @@ pub fn run_wayland_bar() -> Result<(), String> {
 
     loop {
         let signal = signals::take_visibility_signal();
-        if signal == SIGNAL_SHOW && !state.visible {
+        if signal & SIGNAL_SHOW != 0 && !state.visible {
             state.visible = true;
             state.needs_redraw = true;
-        } else if signal == SIGNAL_HIDE && state.visible {
+        }
+        if signal & SIGNAL_HIDE != 0 && state.visible {
             state.visible = false;
             state.needs_redraw = true;
+        }
+        if signal & SIGNAL_DETAIL_ON != 0 && !state.detail_mode {
+            state.detail_mode = true;
+            state.refresh_detail_status();
+        }
+        if signal & SIGNAL_DETAIL_OFF != 0 && state.detail_mode {
+            state.detail_mode = false;
+            state.refresh_detail_status();
         }
 
         event_queue
@@ -124,6 +133,7 @@ struct AppState {
     closed: bool,
     visible: bool,
     needs_redraw: bool,
+    detail_mode: bool,
     last_workspace_poll: Instant,
     last_volume_poll: Instant,
     last_song_poll: Instant,
@@ -155,6 +165,7 @@ impl AppState {
             closed: false,
             visible: false,
             needs_redraw: false,
+            detail_mode: false,
             last_workspace_poll: Instant::now() - Duration::from_millis(WORKSPACE_POLL_HIDDEN_MS),
             last_volume_poll: Instant::now() - Duration::from_millis(VOLUME_POLL_HIDDEN_MS),
             last_song_poll: Instant::now() - Duration::from_millis(SONG_POLL_HIDDEN_MS),
@@ -163,9 +174,18 @@ impl AppState {
                 - Duration::from_millis(DATETIME_REFRESH_HIDDEN_MS),
             status_events: streams.rx,
             workspace_event_driven: streams.workspace_event_driven,
-            status: BarStatus::gather(),
+            status: BarStatus::gather(false),
             visible_buffer: None,
             hidden_buffer: None,
+        }
+    }
+
+    fn refresh_detail_status(&mut self) {
+        self.status.battery = status::gather_battery(self.detail_mode);
+        self.status.volume = status::gather_volume(self.detail_mode);
+        self.recreate_buffers();
+        if self.visible {
+            self.needs_redraw = true;
         }
     }
 
@@ -221,7 +241,7 @@ impl AppState {
         }
 
         if now.duration_since(self.last_volume_poll) >= Duration::from_millis(volume_poll_ms) {
-            let next_volume = status::gather_volume();
+            let next_volume = status::gather_volume(self.detail_mode);
             if self.status.volume != next_volume {
                 self.status.volume = next_volume;
                 changed = true;
@@ -241,7 +261,7 @@ impl AppState {
         if now.duration_since(self.last_battery_refresh)
             >= Duration::from_millis(BATTERY_REFRESH_MS)
         {
-            let next_battery = status::gather_battery();
+            let next_battery = status::gather_battery(self.detail_mode);
             if self.status.battery != next_battery {
                 self.status.battery = next_battery;
                 changed = true;

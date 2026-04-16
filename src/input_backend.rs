@@ -47,7 +47,10 @@ pub fn run_input_backend() {
 
     let mut left_meta = false;
     let mut right_meta = false;
+    let mut left_shift = false;
+    let mut right_shift = false;
     let mut visible = false;
+    let mut detail = false;
 
     while poll(&mut [pollfd.clone()], None::<u8>).is_ok() {
         if let Err(err) = input.dispatch() {
@@ -70,6 +73,8 @@ pub fn run_input_backend() {
             match ev_key {
                 EV_KEY::KEY_LEFTMETA => left_meta = pressed,
                 EV_KEY::KEY_RIGHTMETA => right_meta = pressed,
+                EV_KEY::KEY_LEFTSHIFT => left_shift = pressed,
+                EV_KEY::KEY_RIGHTSHIFT => right_shift = pressed,
                 _ => continue,
             }
 
@@ -81,6 +86,16 @@ pub fn run_input_backend() {
                     libc::SIGUSR2
                 });
                 visible = next_visible;
+            }
+
+            let next_detail = next_visible && (left_shift || right_shift);
+            if next_detail != detail {
+                process::send_signal(if next_detail {
+                    libc::SIGWINCH
+                } else {
+                    libc::SIGURG
+                });
+                detail = next_detail;
             }
         }
     }
