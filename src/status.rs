@@ -9,6 +9,7 @@ use std::time::Duration;
 
 pub struct BarStatus {
     pub workspaces: String,
+    pub song: String,
     pub battery: String,
     pub volume: String,
     pub datetime: String,
@@ -28,6 +29,7 @@ impl BarStatus {
     pub fn gather() -> Self {
         Self {
             workspaces: format_workspaces(),
+            song: gather_song(),
             battery: gather_battery(),
             volume: gather_volume(),
             datetime: gather_datetime(),
@@ -37,11 +39,14 @@ impl BarStatus {
     pub fn gather_workspaces() -> String {
         format_workspaces()
     }
-
 }
 
 pub fn gather_battery() -> String {
     format_battery()
+}
+
+pub fn gather_song() -> String {
+    format_song()
 }
 
 pub fn gather_volume() -> String {
@@ -104,7 +109,12 @@ fn hyprland_signature() -> Option<String> {
 fn hyprland_event_socket_path(sig: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime).join("hypr").join(sig).join(".socket2.sock"));
+        candidates.push(
+            PathBuf::from(runtime)
+                .join("hypr")
+                .join(sig)
+                .join(".socket2.sock"),
+        );
     }
     candidates.push(PathBuf::from("/tmp/hypr").join(sig).join(".socket2.sock"));
     candidates.into_iter().find(|p| p.exists())
@@ -167,6 +177,27 @@ fn format_battery() -> String {
     } else {
         format!("BAT {value}%")
     }
+}
+
+fn format_song() -> String {
+    let raw = run_cmd("rmpc", &["song"]).unwrap_or_default();
+    if raw.trim().is_empty() {
+        return String::new();
+    }
+
+    let title = find_json_string_field(&raw, "title")
+        .or_else(|| song_title_from_file(&raw))
+        .unwrap_or_default();
+    let artist = find_json_string_field(&raw, "artist").unwrap_or_default();
+
+    let label = match (sanitize_bar_text(&title), sanitize_bar_text(&artist)) {
+        (title, artist) if title.is_empty() && artist.is_empty() => String::new(),
+        (title, artist) if artist.is_empty() => title,
+        (title, artist) if title.is_empty() => artist,
+        (title, artist) => format!("{artist} - {title}"),
+    };
+
+    label.trim().to_string()
 }
 
 fn format_volume() -> String {
@@ -347,6 +378,79 @@ fn parse_json_i64_field(raw: &str, field: &str) -> Option<i64> {
     parse_i64_from(raw, pos)
 }
 
+fn find_json_string_field(raw: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\":\"");
+    let start = raw.find(&marker)? + marker.len();
+    parse_json_string(raw, start)
+}
+
+fn parse_json_string(raw: &str, start: usize) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut i = start;
+    let mut out = String::new();
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(out),
+            b'\\' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return None;
+                }
+                match bytes[i] {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let hex = raw.get(i + 1..i + 5)?;
+                        let value = u16::from_str_radix(hex, 16).ok()?;
+                        let ch = char::from_u32(value as u32)?;
+                        out.push(ch);
+                        i += 4;
+                    }
+                    _ => return None,
+                }
+            }
+            byte => out.push(byte as char),
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn song_title_from_file(raw: &str) -> Option<String> {
+    let file = find_json_string_field(raw, "file")?;
+    let file_name = file.rsplit('/').next()?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    Some(stem.to_string())
+}
+
+fn sanitize_bar_text(input: &str) -> String {
+    input
+        .chars()
+        .filter_map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | ' ' | '[' | ']' | ':' | '%' | '-' | '.' | '/' => {
+                Some(ch)
+            }
+            '&' => Some(' '),
+            '_' => Some(' '),
+            _ => None,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn parse_workspace_ids(raw: &str) -> Vec<i64> {
     let marker = "\"id\":";
     let mut out = Vec::new();
@@ -385,7 +489,10 @@ fn parse_i64_from(s: &str, mut i: usize) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_battery_charging, is_volume_muted, parse_i64_from, parse_volume_percent, parse_workspace_ids};
+    use super::{
+        find_json_string_field, is_battery_charging, is_volume_muted, parse_i64_from,
+        parse_volume_percent, parse_workspace_ids, sanitize_bar_text, song_title_from_file,
+    };
 
     #[test]
     fn parse_i64_from_reads_positive_and_negative() {
@@ -436,4 +543,33 @@ mod tests {
         assert!(!is_battery_charging("Full"));
     }
 
+    #[test]
+    fn find_json_string_field_reads_nested_values() {
+        let raw = r#"{"metadata":{"title":"Moonlight Shadow","artist":"No Hero"}}"#;
+        assert_eq!(
+            find_json_string_field(raw, "title"),
+            Some("Moonlight Shadow".to_string())
+        );
+        assert_eq!(
+            find_json_string_field(raw, "artist"),
+            Some("No Hero".to_string())
+        );
+    }
+
+    #[test]
+    fn song_title_from_file_uses_basename_without_extension() {
+        let raw = r#"{"file":"No Hero/no hero - moonlight shadow.mp3"}"#;
+        assert_eq!(
+            song_title_from_file(raw),
+            Some("no hero - moonlight shadow".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_bar_text_keeps_supported_glyphs() {
+        assert_eq!(
+            sanitize_bar_text("M83 _ Midnight City (Live)!"),
+            "M83 Midnight City Live"
+        );
+    }
 }

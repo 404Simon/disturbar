@@ -1,18 +1,19 @@
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
-use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use crate::constants::{
     BAR_HEIGHT, BAR_HIDDEN_RGBA, BAR_VISIBLE_RGBA, BATTERY_REFRESH_MS, DATETIME_REFRESH_HIDDEN_MS,
     DATETIME_REFRESH_VISIBLE_MS, LOOP_SLEEP_HIDDEN_MS, LOOP_SLEEP_VISIBLE_MS, MARGIN_SIDE,
-    MARGIN_TOP, SIGNAL_HIDE, SIGNAL_SHOW, TEXT_RGBA, VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS,
-    WORKSPACE_POLL_HIDDEN_MS, WORKSPACE_POLL_VISIBLE_MS,
+    MARGIN_TOP, SIGNAL_HIDE, SIGNAL_SHOW, SONG_POLL_HIDDEN_MS, SONG_POLL_VISIBLE_MS, TEXT_RGBA,
+    VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS, WORKSPACE_POLL_HIDDEN_MS,
+    WORKSPACE_POLL_VISIBLE_MS,
 };
 use crate::renderer::{self, ShmBarBuffer};
 use crate::signals;
@@ -125,6 +126,7 @@ struct AppState {
     needs_redraw: bool,
     last_workspace_poll: Instant,
     last_volume_poll: Instant,
+    last_song_poll: Instant,
     last_battery_refresh: Instant,
     last_datetime_refresh: Instant,
     status_events: Receiver<StatusEvent>,
@@ -155,6 +157,7 @@ impl AppState {
             needs_redraw: false,
             last_workspace_poll: Instant::now() - Duration::from_millis(WORKSPACE_POLL_HIDDEN_MS),
             last_volume_poll: Instant::now() - Duration::from_millis(VOLUME_POLL_HIDDEN_MS),
+            last_song_poll: Instant::now() - Duration::from_millis(SONG_POLL_HIDDEN_MS),
             last_battery_refresh: Instant::now() - Duration::from_millis(BATTERY_REFRESH_MS),
             last_datetime_refresh: Instant::now()
                 - Duration::from_millis(DATETIME_REFRESH_HIDDEN_MS),
@@ -179,6 +182,11 @@ impl AppState {
             VOLUME_POLL_VISIBLE_MS
         } else {
             VOLUME_POLL_HIDDEN_MS
+        };
+        let song_poll_ms = if self.visible {
+            SONG_POLL_VISIBLE_MS
+        } else {
+            SONG_POLL_HIDDEN_MS
         };
         let datetime_refresh_ms = if self.visible {
             DATETIME_REFRESH_VISIBLE_MS
@@ -219,6 +227,15 @@ impl AppState {
                 changed = true;
             }
             self.last_volume_poll = now;
+        }
+
+        if now.duration_since(self.last_song_poll) >= Duration::from_millis(song_poll_ms) {
+            let next_song = status::gather_song();
+            if self.status.song != next_song {
+                self.status.song = next_song;
+                changed = true;
+            }
+            self.last_song_poll = now;
         }
 
         if now.duration_since(self.last_battery_refresh)
@@ -289,6 +306,7 @@ impl AppState {
             BAR_VISIBLE_RGBA,
             TEXT_RGBA,
             &self.status.workspaces,
+            &self.status.song,
             &right,
         );
         self.visible_buffer = renderer::create_buffer_from_pixels(

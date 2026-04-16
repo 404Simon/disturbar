@@ -3,8 +3,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 
 use tempfile::tempfile;
-use wayland_client::protocol::{wl_buffer, wl_shm};
 use wayland_client::QueueHandle;
+use wayland_client::protocol::{wl_buffer, wl_shm};
 
 const GLYPH_SCALE: i32 = 2;
 
@@ -27,8 +27,12 @@ pub fn render_visible_pixels(
     background: [u8; 4],
     text_color: [u8; 4],
     left: &str,
+    center: &str,
     right: &str,
 ) -> Vec<u8> {
+    const SIDE_PADDING: i32 = 14;
+    const SECTION_GAP: i32 = 24;
+
     let stride = (width * 4) as usize;
     let size = stride * height as usize;
     let mut pixels = vec![0_u8; size];
@@ -46,11 +50,36 @@ pub fn render_visible_pixels(
     );
 
     let y = ((height as i32 - glyph_height()) / 2).max(0);
-    draw_text(&mut pixels, width, height, 14, y, left, text_color);
+    draw_text(
+        &mut pixels,
+        width,
+        height,
+        SIDE_PADDING,
+        y,
+        left,
+        text_color,
+    );
 
     let right_w = text_width(right);
-    let right_x = (width as i32 - 14 - right_w).max(14);
+    let right_x = (width as i32 - SIDE_PADDING - right_w).max(SIDE_PADDING);
     draw_text(&mut pixels, width, height, right_x, y, right, text_color);
+
+    let left_end = SIDE_PADDING + text_width(left);
+    let center_min_x = left_end + SECTION_GAP;
+    let center_max_x = right_x - SECTION_GAP;
+    if let Some((center_text, center_x)) =
+        fit_centered_text(center, width as i32, center_min_x, center_max_x)
+    {
+        draw_text(
+            &mut pixels,
+            width,
+            height,
+            center_x,
+            y,
+            &center_text,
+            text_color,
+        );
+    }
 
     pixels
 }
@@ -178,6 +207,59 @@ fn text_width(text: &str) -> i32 {
     text.chars().count() as i32 * glyph_advance()
 }
 
+fn fit_centered_text(text: &str, width: i32, min_x: i32, max_x: i32) -> Option<(String, i32)> {
+    if min_x >= max_x {
+        return None;
+    }
+
+    let available_w = max_x - min_x;
+    if available_w < glyph_advance() * 3 {
+        return None;
+    }
+
+    let fitted = truncate_text_to_width(text, available_w);
+    if fitted.is_empty() {
+        return None;
+    }
+
+    let text_w = text_width(&fitted);
+    let ideal_x = (width - text_w) / 2;
+    let x = ideal_x.clamp(min_x, max_x - text_w);
+    Some((fitted, x))
+}
+
+fn truncate_text_to_width(text: &str, max_width: i32) -> String {
+    if max_width <= 0 {
+        return String::new();
+    }
+
+    if text_width(text) <= max_width {
+        return text.to_string();
+    }
+
+    let ellipsis = "...";
+    let ellipsis_w = text_width(ellipsis);
+    if ellipsis_w > max_width {
+        return String::new();
+    }
+
+    let mut fitted = String::new();
+    for ch in text.chars() {
+        let next_w = text_width(&fitted) + glyph_advance();
+        if next_w + ellipsis_w > max_width {
+            break;
+        }
+        fitted.push(ch);
+    }
+
+    if fitted.is_empty() {
+        String::new()
+    } else {
+        fitted.push_str(ellipsis);
+        fitted
+    }
+}
+
 fn glyph_height() -> i32 {
     7 * GLYPH_SCALE
 }
@@ -274,5 +356,23 @@ fn glyph_rows(ch: char) -> [u8; 7] {
         ],
         ' ' => [0, 0, 0, 0, 0, 0, 0],
         _ => [0b11111, 0b00001, 0b00110, 0b00000, 0b00100, 0, 0],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_centered_text, text_width, truncate_text_to_width};
+
+    #[test]
+    fn truncate_text_to_width_adds_ellipsis_when_needed() {
+        assert_eq!(truncate_text_to_width("ABCDEFGHIJ", 60), "AB...");
+    }
+
+    #[test]
+    fn fit_centered_text_keeps_text_inside_gap_bounds() {
+        let (text, x) = fit_centered_text("SONG NAME", 400, 120, 260).expect("center text");
+        assert_eq!(text, "SONG NAME");
+        assert!(x >= 120);
+        assert!(x + text_width(&text) <= 260);
     }
 }
