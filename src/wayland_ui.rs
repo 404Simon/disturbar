@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -56,6 +56,9 @@ pub fn run_wayland_bar() -> Result<(), String> {
     layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
     layer_surface.set_exclusive_zone(0);
     layer_surface.set_size(0, BAR_HEIGHT);
+    let empty_input_region = compositor.create_region(&qh, ());
+    surface.set_input_region(Some(&empty_input_region));
+    empty_input_region.destroy();
 
     surface.commit();
 
@@ -396,6 +399,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for AppState {
 
 delegate_noop!(AppState: ignore wl_buffer::WlBuffer);
 delegate_noop!(AppState: ignore wl_compositor::WlCompositor);
+delegate_noop!(AppState: ignore wl_region::WlRegion);
 delegate_noop!(AppState: ignore wl_shm::WlShm);
 delegate_noop!(AppState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(AppState: ignore wl_surface::WlSurface);
