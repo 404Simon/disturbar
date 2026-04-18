@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, QueueHandle, delegate_noop};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -11,13 +11,13 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use crate::constants::{
     BAR_HEIGHT, BAR_HIDDEN_RGBA, BAR_VISIBLE_RGBA, BATTERY_REFRESH_MS, DATETIME_REFRESH_HIDDEN_MS,
     DATETIME_REFRESH_VISIBLE_MS, LOOP_SLEEP_HIDDEN_MS, LOOP_SLEEP_VISIBLE_MS, MARGIN_SIDE,
-    MARGIN_TOP, SIGNAL_HIDE, SIGNAL_SHOW, SONG_POLL_HIDDEN_MS, SONG_POLL_VISIBLE_MS, TEXT_RGBA,
-    VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS, WORKSPACE_POLL_HIDDEN_MS,
-    WORKSPACE_POLL_VISIBLE_MS, SIGNAL_DETAIL_OFF, SIGNAL_DETAIL_ON,
+    MARGIN_TOP, SIGNAL_DETAIL_OFF, SIGNAL_DETAIL_ON, SIGNAL_HIDE, SIGNAL_SHOW, SONG_POLL_HIDDEN_MS,
+    SONG_POLL_VISIBLE_MS, TEXT_RGBA, VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS,
+    WORKSPACE_POLL_HIDDEN_MS, WORKSPACE_POLL_VISIBLE_MS,
 };
 use crate::renderer::{self, ShmBarBuffer};
 use crate::signals;
-use crate::status::{self, BarStatus, StatusEvent, StatusEventStreams};
+use crate::status::{self, BarStatus, StatusEvent, StatusEventStreams, WorkspaceStatus};
 
 pub fn run_wayland_bar() -> Result<(), String> {
     signals::register_signal_handlers();
@@ -37,57 +37,35 @@ pub fn run_wayland_bar() -> Result<(), String> {
         .bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(&qh, 1..=4, ())
         .map_err(|e| format!("bind zwlr_layer_shell_v1: {e}"))?;
 
-    let surface = compositor.create_surface(&qh, ());
-    let layer_surface = layer_shell.get_layer_surface(
-        &surface,
-        None,
-        zwlr_layer_shell_v1::Layer::Overlay,
-        "disturbar".to_string(),
-        &qh,
-        (),
-    );
-
-    layer_surface.set_anchor(
-        zwlr_layer_surface_v1::Anchor::Top
-            | zwlr_layer_surface_v1::Anchor::Left
-            | zwlr_layer_surface_v1::Anchor::Right,
-    );
-    layer_surface.set_margin(MARGIN_TOP, MARGIN_SIDE, 0, MARGIN_SIDE);
-    layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
-    layer_surface.set_exclusive_zone(0);
-    layer_surface.set_size(0, BAR_HEIGHT);
-    let empty_input_region = compositor.create_region(&qh, ());
-    surface.set_input_region(Some(&empty_input_region));
-    empty_input_region.destroy();
-
-    surface.commit();
-
     let streams = status::spawn_status_event_streams();
-    let mut state = AppState::new(surface, layer_surface, shm, qh, streams);
+    let mut state = AppState::new(compositor, layer_shell, shm, qh, streams);
 
-    while !state.configured && !state.closed {
+    for global in globals.contents().clone_list() {
+        if global.interface == "wl_output" {
+            state.add_output(globals.registry(), global.name, global.version);
+        }
+    }
+
+    while state.has_unconfigured_monitors() {
         event_queue
             .blocking_dispatch(&mut state)
             .map_err(|e| format!("dispatch init events: {e}"))?;
     }
 
-    if state.needs_redraw {
-        if state.visible {
-            state.tick_status();
-        }
-        state.redraw();
-        state.needs_redraw = false;
+    if state.visible {
+        state.tick_status();
     }
+    state.redraw();
 
     loop {
         let signal = signals::take_visibility_signal();
         if signal & SIGNAL_SHOW != 0 && !state.visible {
             state.visible = true;
-            state.needs_redraw = true;
+            state.mark_all_for_redraw();
         }
         if signal & SIGNAL_HIDE != 0 && state.visible {
             state.visible = false;
-            state.needs_redraw = true;
+            state.mark_all_for_redraw();
         }
         if signal & SIGNAL_DETAIL_ON != 0 && !state.detail_mode {
             state.detail_mode = true;
@@ -102,16 +80,8 @@ pub fn run_wayland_bar() -> Result<(), String> {
             .dispatch_pending(&mut state)
             .map_err(|e| format!("dispatch events: {e}"))?;
 
-        if state.closed {
-            break;
-        }
-
         state.tick_status();
-
-        if state.needs_redraw {
-            state.redraw();
-            state.needs_redraw = false;
-        }
+        state.redraw();
 
         let _ = conn.flush();
         let sleep_ms = if state.visible {
@@ -121,21 +91,15 @@ pub fn run_wayland_bar() -> Result<(), String> {
         };
         std::thread::sleep(Duration::from_millis(sleep_ms));
     }
-
-    Ok(())
 }
 
 struct AppState {
-    surface: wl_surface::WlSurface,
-    _layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    compositor: wl_compositor::WlCompositor,
+    layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1,
     shm: wl_shm::WlShm,
     qh: QueueHandle<Self>,
-    width: u32,
-    height: u32,
-    configured: bool,
-    closed: bool,
+    monitors: Vec<MonitorBar>,
     visible: bool,
-    needs_redraw: bool,
     detail_mode: bool,
     last_workspace_poll: Instant,
     last_volume_poll: Instant,
@@ -145,29 +109,40 @@ struct AppState {
     status_events: Receiver<StatusEvent>,
     workspace_event_driven: bool,
     status: BarStatus,
+}
+
+struct MonitorBar {
+    global_name: u32,
+    _output: wl_output::WlOutput,
+    output_name: Option<String>,
+    surface: wl_surface::WlSurface,
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    width: u32,
+    height: u32,
+    configured: bool,
+    closed: bool,
+    needs_redraw: bool,
+    visible_buffer_dirty: bool,
+    hidden_buffer_dirty: bool,
     visible_buffer: Option<ShmBarBuffer>,
     hidden_buffer: Option<ShmBarBuffer>,
 }
 
 impl AppState {
     fn new(
-        surface: wl_surface::WlSurface,
-        layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        compositor: wl_compositor::WlCompositor,
+        layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1,
         shm: wl_shm::WlShm,
         qh: QueueHandle<Self>,
         streams: StatusEventStreams,
     ) -> Self {
         Self {
-            surface,
-            _layer_surface: layer_surface,
+            compositor,
+            layer_shell,
             shm,
             qh,
-            width: 0,
-            height: BAR_HEIGHT,
-            configured: false,
-            closed: false,
+            monitors: Vec::new(),
             visible: false,
-            needs_redraw: false,
             detail_mode: false,
             last_workspace_poll: Instant::now() - Duration::from_millis(WORKSPACE_POLL_HIDDEN_MS),
             last_volume_poll: Instant::now() - Duration::from_millis(VOLUME_POLL_HIDDEN_MS),
@@ -178,23 +153,108 @@ impl AppState {
             status_events: streams.rx,
             workspace_event_driven: streams.workspace_event_driven,
             status: BarStatus::gather(false),
+        }
+    }
+
+    fn add_output(&mut self, registry: &wl_registry::WlRegistry, global_name: u32, version: u32) {
+        if self
+            .monitors
+            .iter()
+            .any(|monitor| monitor.global_name == global_name)
+        {
+            return;
+        }
+
+        let output = registry.bind::<wl_output::WlOutput, _, _>(
+            global_name,
+            version.min(4),
+            &self.qh,
+            global_name,
+        );
+        let surface = self.compositor.create_surface(&self.qh, ());
+        let layer_surface = self.layer_shell.get_layer_surface(
+            &surface,
+            Some(&output),
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "disturbar".to_string(),
+            &self.qh,
+            global_name,
+        );
+
+        layer_surface.set_anchor(
+            zwlr_layer_surface_v1::Anchor::Top
+                | zwlr_layer_surface_v1::Anchor::Left
+                | zwlr_layer_surface_v1::Anchor::Right,
+        );
+        layer_surface.set_margin(MARGIN_TOP, MARGIN_SIDE, 0, MARGIN_SIDE);
+        layer_surface
+            .set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+        layer_surface.set_exclusive_zone(0);
+        layer_surface.set_size(0, BAR_HEIGHT);
+
+        let empty_input_region = self.compositor.create_region(&self.qh, ());
+        surface.set_input_region(Some(&empty_input_region));
+        empty_input_region.destroy();
+        surface.commit();
+
+        self.monitors.push(MonitorBar {
+            global_name,
+            _output: output,
+            output_name: None,
+            surface,
+            layer_surface,
+            width: 0,
+            height: BAR_HEIGHT,
+            configured: false,
+            closed: false,
+            needs_redraw: false,
+            visible_buffer_dirty: true,
+            hidden_buffer_dirty: true,
             visible_buffer: None,
             hidden_buffer: None,
+        });
+    }
+
+    fn remove_output(&mut self, global_name: u32) {
+        if let Some(idx) = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.global_name == global_name)
+        {
+            let monitor = self.monitors.remove(idx);
+            monitor.destroy();
+        }
+    }
+
+    fn has_unconfigured_monitors(&self) -> bool {
+        self.monitors
+            .iter()
+            .any(|monitor| !monitor.closed && !monitor.configured)
+    }
+
+    fn mark_all_for_redraw(&mut self) {
+        for monitor in &mut self.monitors {
+            if monitor.closed || !monitor.configured {
+                continue;
+            }
+            monitor.needs_redraw = true;
+        }
+    }
+
+    fn mark_all_visible_buffers_dirty(&mut self) {
+        for monitor in &mut self.monitors {
+            monitor.mark_visible_dirty(self.visible);
         }
     }
 
     fn refresh_detail_status(&mut self) {
         self.status.battery = status::gather_battery(self.detail_mode);
         self.status.volume = status::gather_volume(self.detail_mode);
-        self.recreate_buffers();
-        if self.visible {
-            self.needs_redraw = true;
-        }
+        self.mark_all_visible_buffers_dirty();
     }
 
     fn tick_status(&mut self) {
         let now = Instant::now();
-        let mut changed = false;
         let mut workspace_dirty = false;
         let workspace_poll_ms = if self.visible {
             WORKSPACE_POLL_VISIBLE_MS
@@ -224,22 +284,14 @@ impl AppState {
         }
 
         if workspace_dirty {
-            let next_workspaces = BarStatus::gather_workspaces();
-            if self.status.workspaces != next_workspaces {
-                self.status.workspaces = next_workspaces;
-                changed = true;
-            }
+            self.apply_workspace_update(BarStatus::gather_workspaces());
         }
 
         if !self.workspace_event_driven
             && now.duration_since(self.last_workspace_poll)
                 >= Duration::from_millis(workspace_poll_ms)
         {
-            let next_workspaces = BarStatus::gather_workspaces();
-            if self.status.workspaces != next_workspaces {
-                self.status.workspaces = next_workspaces;
-                changed = true;
-            }
+            self.apply_workspace_update(BarStatus::gather_workspaces());
             self.last_workspace_poll = now;
         }
 
@@ -247,7 +299,7 @@ impl AppState {
             let next_volume = status::gather_volume(self.detail_mode);
             if self.status.volume != next_volume {
                 self.status.volume = next_volume;
-                changed = true;
+                self.mark_all_visible_buffers_dirty();
             }
             self.last_volume_poll = now;
         }
@@ -256,7 +308,7 @@ impl AppState {
             let next_song = status::gather_song();
             if self.status.song != next_song {
                 self.status.song = next_song;
-                changed = true;
+                self.mark_all_visible_buffers_dirty();
             }
             self.last_song_poll = now;
         }
@@ -267,7 +319,7 @@ impl AppState {
             let next_battery = status::gather_battery(self.detail_mode);
             if self.status.battery != next_battery {
                 self.status.battery = next_battery;
-                changed = true;
+                self.mark_all_visible_buffers_dirty();
             }
             self.last_battery_refresh = now;
         }
@@ -278,104 +330,220 @@ impl AppState {
             let next_datetime = status::gather_datetime();
             if self.status.datetime != next_datetime {
                 self.status.datetime = next_datetime;
-                changed = true;
+                self.mark_all_visible_buffers_dirty();
             }
             self.last_datetime_refresh = now;
         }
+    }
 
-        if changed {
-            self.recreate_buffers();
-            if self.visible {
-                self.needs_redraw = true;
+    fn apply_workspace_update(&mut self, next: WorkspaceStatus) {
+        if self.status.workspaces == next {
+            return;
+        }
+
+        for monitor in &mut self.monitors {
+            let old_label = self
+                .status
+                .workspaces
+                .label_for_monitor(monitor.output_name.as_deref());
+            let next_label = next.label_for_monitor(monitor.output_name.as_deref());
+            if old_label != next_label {
+                monitor.mark_visible_dirty(self.visible);
             }
         }
+
+        self.status.workspaces = next;
     }
 
     fn redraw(&mut self) {
-        if !self.configured || self.width == 0 || self.height == 0 {
-            return;
-        }
-
-        self.ensure_buffers();
-
-        let selected = if self.visible {
-            self.visible_buffer.as_ref()
-        } else {
-            self.hidden_buffer.as_ref()
-        };
-
-        let Some(selected) = selected else {
-            return;
-        };
-
-        self.surface.attach(Some(&selected.buffer), 0, 0);
-        self.surface
-            .damage_buffer(0, 0, self.width as i32, self.height as i32);
-        self.surface.commit();
-    }
-
-    fn ensure_buffers(&mut self) {
-        if self.visible_buffer.is_some() {
-            return;
-        }
-
         let right = format!(
             "{}  {}  {}",
             self.status.battery, self.status.volume, self.status.datetime
         );
-        let visible_pixels = renderer::render_visible_pixels(
+
+        for monitor in &mut self.monitors {
+            monitor.redraw(
+                &self.shm,
+                &self.qh,
+                self.visible,
+                &self.status.workspaces,
+                &self.status.song,
+                &right,
+            );
+        }
+    }
+}
+
+impl MonitorBar {
+    fn mark_visible_dirty(&mut self, visible: bool) {
+        self.visible_buffer_dirty = true;
+        self.visible_buffer = None;
+        if visible && self.configured && !self.closed {
+            self.needs_redraw = true;
+        }
+    }
+
+    fn set_output_name(&mut self, output_name: String, visible: bool) {
+        if self.output_name.as_deref() == Some(output_name.as_str()) {
+            return;
+        }
+        self.output_name = Some(output_name);
+        self.mark_visible_dirty(visible);
+    }
+
+    fn configure(&mut self, width: u32, height: u32) {
+        self.configured = true;
+        self.width = width;
+        self.height = if height == 0 { BAR_HEIGHT } else { height };
+        self.visible_buffer_dirty = true;
+        self.hidden_buffer_dirty = true;
+        self.visible_buffer = None;
+        self.hidden_buffer = None;
+        self.needs_redraw = true;
+    }
+
+    fn ensure_visible_buffer(
+        &mut self,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<AppState>,
+        workspaces: &WorkspaceStatus,
+        center: &str,
+        right: &str,
+    ) {
+        if !self.visible_buffer_dirty && self.visible_buffer.is_some() {
+            return;
+        }
+
+        let left = workspaces.label_for_monitor(self.output_name.as_deref());
+        let pixels = renderer::render_visible_pixels(
             self.width,
             self.height,
             BAR_VISIBLE_RGBA,
             TEXT_RGBA,
-            &self.status.workspaces,
-            &self.status.song,
-            &right,
+            left,
+            center,
+            right,
         );
-        self.visible_buffer = renderer::create_buffer_from_pixels(
-            &self.shm,
-            &self.qh,
-            self.width,
-            self.height,
-            &visible_pixels,
-        );
-        self.hidden_buffer = renderer::create_solid_bar_buffer(
-            &self.shm,
-            &self.qh,
-            self.width,
-            self.height,
-            BAR_HIDDEN_RGBA,
-        );
+        self.visible_buffer =
+            renderer::create_buffer_from_pixels(shm, qh, self.width, self.height, &pixels);
+        self.visible_buffer_dirty = false;
     }
 
-    fn recreate_buffers(&mut self) {
-        self.visible_buffer = None;
-        self.hidden_buffer = None;
-        self.ensure_buffers();
+    fn ensure_hidden_buffer(&mut self, shm: &wl_shm::WlShm, qh: &QueueHandle<AppState>) {
+        if !self.hidden_buffer_dirty && self.hidden_buffer.is_some() {
+            return;
+        }
+
+        self.hidden_buffer =
+            renderer::create_solid_bar_buffer(shm, qh, self.width, self.height, BAR_HIDDEN_RGBA);
+        self.hidden_buffer_dirty = false;
+    }
+
+    fn redraw(
+        &mut self,
+        shm: &wl_shm::WlShm,
+        qh: &QueueHandle<AppState>,
+        visible: bool,
+        workspaces: &WorkspaceStatus,
+        center: &str,
+        right: &str,
+    ) {
+        if !self.needs_redraw
+            || !self.configured
+            || self.closed
+            || self.width == 0
+            || self.height == 0
+        {
+            return;
+        }
+
+        let buffer = if visible {
+            self.ensure_visible_buffer(shm, qh, workspaces, center, right);
+            self.visible_buffer.as_ref()
+        } else {
+            self.ensure_hidden_buffer(shm, qh);
+            self.hidden_buffer.as_ref()
+        };
+
+        let Some(buffer) = buffer else {
+            return;
+        };
+
+        self.surface.attach(Some(&buffer.buffer), 0, 0);
+        self.surface
+            .damage_buffer(0, 0, self.width as i32, self.height as i32);
+        self.surface.commit();
+        self.needs_redraw = false;
+    }
+
+    fn destroy(self) {
+        self.layer_surface.destroy();
+        self.surface.destroy();
     }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppState {
     fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
+        state: &mut Self,
+        proxy: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == "wl_output" {
+                    state.add_output(proxy, name, version);
+                }
+            }
+            wl_registry::Event::GlobalRemove { name } => state.remove_output(name),
+            _ => {}
+        }
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for AppState {
+impl Dispatch<wl_output::WlOutput, u32> for AppState {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        global_name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event
+            && let Some(monitor) = state
+                .monitors
+                .iter_mut()
+                .find(|monitor| monitor.global_name == *global_name)
+        {
+            monitor.set_output_name(name, state.visible);
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for AppState {
     fn event(
         state: &mut Self,
         proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: zwlr_layer_surface_v1::Event,
-        _: &(),
+        global_name: &u32,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let Some(monitor) = state
+            .monitors
+            .iter_mut()
+            .find(|monitor| monitor.global_name == *global_name)
+        else {
+            return;
+        };
+
         match event {
             zwlr_layer_surface_v1::Event::Configure {
                 serial,
@@ -383,14 +551,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for AppState {
                 height,
             } => {
                 proxy.ack_configure(serial);
-                state.configured = true;
-                state.width = width;
-                state.height = if height == 0 { BAR_HEIGHT } else { height };
-                state.recreate_buffers();
-                state.needs_redraw = true;
+                monitor.configure(width, height);
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                state.closed = true;
+                monitor.closed = true;
             }
             _ => {}
         }

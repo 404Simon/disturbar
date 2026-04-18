@@ -7,8 +7,22 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
 
+use serde::Deserialize;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceStatus {
+    labels: Vec<MonitorWorkspaceLabel>,
+    fallback: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MonitorWorkspaceLabel {
+    monitor: String,
+    label: String,
+}
+
 pub struct BarStatus {
-    pub workspaces: String,
+    pub workspaces: WorkspaceStatus,
     pub song: String,
     pub battery: String,
     pub volume: String,
@@ -25,6 +39,22 @@ pub struct StatusEventStreams {
     pub workspace_event_driven: bool,
 }
 
+impl WorkspaceStatus {
+    pub fn label_for_monitor(&self, monitor_name: Option<&str>) -> &str {
+        if let Some(monitor_name) = monitor_name
+            && let Some(label) = self
+                .labels
+                .iter()
+                .find(|entry| entry.monitor == monitor_name)
+                .map(|entry| entry.label.as_str())
+        {
+            return label;
+        }
+
+        &self.fallback
+    }
+}
+
 impl BarStatus {
     pub fn gather(detail_mode: bool) -> Self {
         Self {
@@ -36,7 +66,7 @@ impl BarStatus {
         }
     }
 
-    pub fn gather_workspaces() -> String {
+    pub fn gather_workspaces() -> WorkspaceStatus {
         format_workspaces()
     }
 }
@@ -144,23 +174,70 @@ fn send_dirty_event(tx: &SyncSender<StatusEvent>, event: StatusEvent) {
     let _ = tx.try_send(event);
 }
 
-fn format_workspaces() -> String {
+fn format_workspaces() -> WorkspaceStatus {
     let active_raw = run_hyprctl(&["-j", "activeworkspace"]).unwrap_or_default();
+    let monitors_raw = run_hyprctl(&["-j", "monitors"]).unwrap_or_default();
     let list_raw = run_hyprctl(&["-j", "workspaces"]).unwrap_or_default();
 
-    let active_id = parse_json_i64_field(&active_raw, "id").unwrap_or(1);
-    let mut ids = parse_workspace_ids(&list_raw);
+    let active_id = parse_json_i64_field(&active_raw, "id")
+        .or_else(|| {
+            parse_monitors(&monitors_raw)
+                .iter()
+                .find_map(|m| m.active_workspace_id)
+        })
+        .unwrap_or(1);
 
-    ids.sort_unstable();
-    ids.dedup();
+    let mut all_ids = parse_workspace_ids(&list_raw);
+    all_ids.sort_unstable();
+    all_ids.dedup();
 
-    if ids.is_empty() {
-        return "[1] 2 3 4 5".to_string();
-    }
+    let fallback = if all_ids.is_empty() {
+        "[1] 2 3 4 5".to_string()
+    } else {
+        format_workspace_label(&all_ids, Some(active_id))
+    };
 
-    ids.into_iter()
+    let monitors = parse_monitors(&monitors_raw);
+    let workspaces = parse_monitor_workspaces(&list_raw);
+
+    let labels = monitors
+        .into_iter()
+        .map(|monitor| {
+            let mut ids = workspaces
+                .iter()
+                .filter(|workspace| workspace.monitor == monitor.name)
+                .map(|workspace| workspace.id)
+                .filter(|id| *id > 0)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+
+            if ids.is_empty()
+                && let Some(active_id) = monitor.active_workspace_id
+            {
+                ids.push(active_id);
+            }
+
+            let label = if ids.is_empty() {
+                fallback.clone()
+            } else {
+                format_workspace_label(&ids, monitor.active_workspace_id)
+            };
+
+            MonitorWorkspaceLabel {
+                monitor: monitor.name,
+                label,
+            }
+        })
+        .collect();
+
+    WorkspaceStatus { labels, fallback }
+}
+
+fn format_workspace_label(ids: &[i64], active_id: Option<i64>) -> String {
+    ids.iter()
         .map(|id| {
-            if id == active_id {
+            if Some(*id) == active_id {
                 format!("[{id}]")
             } else {
                 id.to_string()
@@ -475,7 +552,12 @@ fn is_battery_charging(status: &str) -> bool {
 fn parse_wpctl_device_name(output: &str) -> Option<String> {
     for line in output.lines() {
         let trimmed = line.trim();
-        for key in ["node.description", "device.description", "device.nick", "node.nick"] {
+        for key in [
+            "node.description",
+            "device.description",
+            "device.nick",
+            "node.nick",
+        ] {
             let marker = format!("{key} = \"");
             if let Some(start) = trimmed.find(&marker) {
                 let value = &trimmed[start + marker.len()..];
@@ -625,12 +707,66 @@ fn parse_i64_from(s: &str, mut i: usize) -> Option<i64> {
     s[start..i].parse::<i64>().ok()
 }
 
+#[derive(Deserialize)]
+struct HyprMonitorRaw {
+    name: String,
+    #[serde(rename = "activeWorkspace")]
+    active_workspace: Option<HyprWorkspaceRef>,
+}
+
+#[derive(Deserialize)]
+struct HyprWorkspaceRef {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct HyprWorkspaceRaw {
+    id: i64,
+    monitor: Option<String>,
+}
+
+struct HyprMonitorInfo {
+    name: String,
+    active_workspace_id: Option<i64>,
+}
+
+struct HyprWorkspaceInfo {
+    id: i64,
+    monitor: String,
+}
+
+fn parse_monitors(raw: &str) -> Vec<HyprMonitorInfo> {
+    serde_json::from_str::<Vec<HyprMonitorRaw>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|monitor| HyprMonitorInfo {
+            name: monitor.name,
+            active_workspace_id: monitor.active_workspace.map(|workspace| workspace.id),
+        })
+        .collect()
+}
+
+fn parse_monitor_workspaces(raw: &str) -> Vec<HyprWorkspaceInfo> {
+    serde_json::from_str::<Vec<HyprWorkspaceRaw>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|workspace| {
+            let monitor = workspace.monitor?;
+            Some(HyprWorkspaceInfo {
+                id: workspace.id,
+                monitor,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         find_json_string_field, format_volume_device_label, is_battery_charging, is_volume_muted,
-        parse_i64_from, parse_volume_percent, parse_workspace_ids, parse_wpctl_device_name,
-        read_battery_metric, sanitize_bar_text, song_title_from_file,
+        parse_i64_from, parse_monitor_workspaces, parse_monitors, parse_volume_percent,
+        parse_workspace_ids, parse_wpctl_device_name, read_battery_metric, sanitize_bar_text,
+        song_title_from_file,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -657,6 +793,27 @@ mod tests {
     fn parse_workspace_ids_skips_invalid_entries() {
         let raw = r#"[{"id":"bad"},{"id":9}]"#;
         assert_eq!(parse_workspace_ids(raw), vec![9]);
+    }
+
+    #[test]
+    fn parse_monitors_reads_names_and_active_workspace() {
+        let raw = r#"[{"name":"DP-1","activeWorkspace":{"id":2}},{"name":"HDMI-A-1","activeWorkspace":{"id":7}}]"#;
+        let parsed = parse_monitors(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "DP-1");
+        assert_eq!(parsed[0].active_workspace_id, Some(2));
+        assert_eq!(parsed[1].name, "HDMI-A-1");
+        assert_eq!(parsed[1].active_workspace_id, Some(7));
+    }
+
+    #[test]
+    fn parse_monitor_workspaces_keeps_monitor_mapping() {
+        let raw = r#"[{"id":2,"monitor":"DP-1"},{"id":7,"monitor":"HDMI-A-1"}]"#;
+        let parsed = parse_monitor_workspaces(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, 2);
+        assert_eq!(parsed[0].monitor, "DP-1");
+        assert_eq!(parsed[1].monitor, "HDMI-A-1");
     }
 
     #[test]
@@ -720,7 +877,10 @@ mod tests {
 id 48, type PipeWire:Interface:Node
     node.description = "USB Headset"
 "#;
-        assert_eq!(parse_wpctl_device_name(raw), Some("USB Headset".to_string()));
+        assert_eq!(
+            parse_wpctl_device_name(raw),
+            Some("USB Headset".to_string())
+        );
     }
 
     #[test]
