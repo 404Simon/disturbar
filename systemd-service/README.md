@@ -1,9 +1,9 @@
 # disturbar systemd setup (global mode)
 
-This directory contains system-wide unit files for running both disturbar processes.
+This directory contains unit files for running both disturbar processes.
 
-- `disturbar-input-backend.service`: listens for Super key state
-- `disturbar-ui.service`: runs raw Wayland layer-shell bar process
+- `disturbar-input-backend.service`: system service that listens for Super key state (needs input device access)
+- `disturbar-ui.service`: **user service** that runs the raw Wayland layer-shell bar process
 
 ## 1) Build and install binary
 
@@ -17,15 +17,17 @@ sudo install -m 0755 ./target/release/disturbar /usr/local/bin/disturbar
 ## 2) Copy unit files
 
 ```bash
+# Backend runs as root for input device access
 sudo install -m 0644 ./systemd-service/disturbar-input-backend.service /etc/systemd/system/
-sudo install -m 0644 ./systemd-service/disturbar-ui.service /etc/systemd/system/
+
+# UI runs as your desktop user, tied to the graphical session
+sudo install -m 0644 ./systemd-service/disturbar-ui.service /etc/systemd/user/
 ```
 
-## 3) Edit UI unit for your user/session
+## 3) Edit UI unit for your session
 
-Open `/etc/systemd/system/disturbar-ui.service` and adjust:
+Open `/etc/systemd/user/disturbar-ui.service` and adjust:
 
-- `User=` and `Group=` (your login user)
 - `XDG_RUNTIME_DIR=/run/user/<UID>`
 - `WAYLAND_DISPLAY=` (usually `wayland-0`)
 
@@ -39,7 +41,7 @@ echo "$WAYLAND_DISPLAY"
 
 ## 4) Optional: override env in `/etc/default/disturbar`
 
-The UI unit reads optional env file:
+The UI unit reads an optional env file:
 
 - `/etc/default/disturbar`
 
@@ -71,20 +73,13 @@ EOF
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now disturbar-input-backend.service
-sudo systemctl enable --now disturbar-ui.service
-```
 
-## 6) Verify and debug
-
-```bash
-systemctl status disturbar-input-backend.service
-systemctl status disturbar-ui.service
-systemctl show disturbar-ui.service -p Environment --no-pager
-journalctl -u disturbar-input-backend.service -f
-journalctl -u disturbar-ui.service -f
+# User service for the UI
+systemctl --user daemon-reload
+systemctl --user enable --now disturbar-ui.service
 ```
 
 ## Notes
 
 - Backend needs access to input devices (`/dev/input/event*`). Running as system service solves this on most setups.
-- UI service must run as logged-in desktop user so Wayland session variables are valid.
+- UI service must run as the logged-in desktop user so the Wayland session variables are valid.
