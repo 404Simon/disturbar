@@ -76,6 +76,15 @@ pub fn run_wayland_bar() -> Result<(), String> {
             state.refresh_detail_status();
         }
 
+        if let Some(read_guard) = conn.prepare_read() {
+            match read_guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(format!("read wayland events: {e}")),
+            }
+        }
+
         event_queue
             .dispatch_pending(&mut state)
             .map_err(|e| format!("dispatch events: {e}"))?;
