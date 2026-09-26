@@ -11,9 +11,9 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use crate::constants::{
     BAR_HEIGHT, BAR_HIDDEN_RGBA, BAR_VISIBLE_RGBA, BATTERY_REFRESH_MS, DATETIME_REFRESH_HIDDEN_MS,
     DATETIME_REFRESH_VISIBLE_MS, LOOP_SLEEP_HIDDEN_MS, LOOP_SLEEP_VISIBLE_MS, MARGIN_SIDE,
-    MARGIN_TOP, SIGNAL_DETAIL_OFF, SIGNAL_DETAIL_ON, SIGNAL_HIDE, SIGNAL_SHOW, SONG_POLL_HIDDEN_MS,
-    SONG_POLL_VISIBLE_MS, TEXT_RGBA, VOLUME_POLL_HIDDEN_MS, VOLUME_POLL_VISIBLE_MS,
-    WORKSPACE_POLL_HIDDEN_MS, WORKSPACE_POLL_VISIBLE_MS,
+    MARGIN_TOP, MEMORY_REFRESH_MS, SIGNAL_DETAIL_OFF, SIGNAL_DETAIL_ON, SIGNAL_HIDE, SIGNAL_SHOW,
+    SONG_POLL_HIDDEN_MS, SONG_POLL_VISIBLE_MS, TEXT_RGBA, VOLUME_POLL_HIDDEN_MS,
+    VOLUME_POLL_VISIBLE_MS, WORKSPACE_POLL_HIDDEN_MS, WORKSPACE_POLL_VISIBLE_MS,
 };
 use crate::renderer::{self, ShmBarBuffer};
 use crate::signals;
@@ -114,6 +114,7 @@ struct AppState {
     last_volume_poll: Instant,
     last_song_poll: Instant,
     last_battery_refresh: Instant,
+    last_memory_refresh: Instant,
     last_datetime_refresh: Instant,
     status_events: Receiver<StatusEvent>,
     workspace_event_driven: bool,
@@ -157,6 +158,7 @@ impl AppState {
             last_volume_poll: Instant::now() - Duration::from_millis(VOLUME_POLL_HIDDEN_MS),
             last_song_poll: Instant::now() - Duration::from_millis(SONG_POLL_HIDDEN_MS),
             last_battery_refresh: Instant::now() - Duration::from_millis(BATTERY_REFRESH_MS),
+            last_memory_refresh: Instant::now() - Duration::from_millis(MEMORY_REFRESH_MS),
             last_datetime_refresh: Instant::now()
                 - Duration::from_millis(DATETIME_REFRESH_HIDDEN_MS),
             status_events: streams.rx,
@@ -333,6 +335,17 @@ impl AppState {
             self.last_battery_refresh = now;
         }
 
+        if now.duration_since(self.last_memory_refresh)
+            >= Duration::from_millis(MEMORY_REFRESH_MS)
+        {
+            let next_memory = status::gather_memory();
+            if self.status.memory != next_memory {
+                self.status.memory = next_memory;
+                self.mark_all_visible_buffers_dirty();
+            }
+            self.last_memory_refresh = now;
+        }
+
         if now.duration_since(self.last_datetime_refresh)
             >= Duration::from_millis(datetime_refresh_ms)
         {
@@ -366,8 +379,8 @@ impl AppState {
 
     fn redraw(&mut self) {
         let right = format!(
-            "{}  {}  {}",
-            self.status.battery, self.status.volume, self.status.datetime
+            "{}  {}  {}  {}",
+            self.status.memory, self.status.battery, self.status.volume, self.status.datetime
         );
 
         for monitor in &mut self.monitors {

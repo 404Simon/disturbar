@@ -24,6 +24,7 @@ struct MonitorWorkspaceLabel {
 pub struct BarStatus {
     pub workspaces: WorkspaceStatus,
     pub song: String,
+    pub memory: String,
     pub battery: String,
     pub volume: String,
     pub datetime: String,
@@ -60,6 +61,7 @@ impl BarStatus {
         Self {
             workspaces: format_workspaces(),
             song: gather_song(),
+            memory: gather_memory(),
             battery: gather_battery(detail_mode),
             volume: gather_volume(detail_mode),
             datetime: gather_datetime(),
@@ -77,6 +79,10 @@ pub fn gather_battery(detail_mode: bool) -> String {
 
 pub fn gather_song() -> String {
     format_song()
+}
+
+pub fn gather_memory() -> String {
+    format_memory()
 }
 
 pub fn gather_volume(detail_mode: bool) -> String {
@@ -261,6 +267,44 @@ fn format_battery(detail_mode: bool) -> String {
     } else {
         format!("BAT {value}%")
     }
+}
+
+fn format_memory() -> String {
+    match read_memory_usage_gib() {
+        Some(used_gib) => format!("MEM {used_gib:.1} GiB"),
+        None => "MEM --".to_string(),
+    }
+}
+
+fn read_memory_usage_gib() -> Option<f64> {
+    let raw = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_memory_usage_gib(&raw)
+}
+
+fn parse_memory_usage_gib(meminfo: &str) -> Option<f64> {
+    let total_kb = parse_meminfo_field_kb(meminfo, "MemTotal")?;
+    let available_kb = parse_meminfo_field_kb(meminfo, "MemAvailable")?;
+    if total_kb == 0 {
+        return None;
+    }
+    let used_kb = total_kb.saturating_sub(available_kb);
+    Some(used_kb as f64 / 1024.0 / 1024.0)
+}
+
+fn parse_meminfo_field_kb(meminfo: &str, field: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        let Some(rest) = line.strip_prefix(field) else {
+            continue;
+        };
+        let rest = rest.trim_start_matches([' ', '\t', ':']);
+        let Some(value) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(parsed) = value.parse::<u64>() {
+            return Some(parsed);
+        }
+    }
+    None
 }
 
 fn format_song() -> String {
@@ -764,9 +808,9 @@ fn parse_monitor_workspaces(raw: &str) -> Vec<HyprWorkspaceInfo> {
 mod tests {
     use super::{
         find_json_string_field, format_volume_device_label, is_battery_charging, is_volume_muted,
-        parse_i64_from, parse_monitor_workspaces, parse_monitors, parse_volume_percent,
-        parse_workspace_ids, parse_wpctl_device_name, read_battery_metric, sanitize_bar_text,
-        song_title_from_file,
+        parse_i64_from, parse_meminfo_field_kb, parse_memory_usage_gib, parse_monitor_workspaces,
+        parse_monitors, parse_volume_percent, parse_workspace_ids, parse_wpctl_device_name,
+        read_battery_metric, sanitize_bar_text, song_title_from_file,
     };
     use std::fs;
     use tempfile::tempdir;
@@ -910,5 +954,25 @@ id 48, type PipeWire:Interface:Node
             read_battery_metric(&dir.path().to_path_buf(), &["power_now", "current_now"]),
             Some(750000.0)
         );
+    }
+
+    #[test]
+    fn parse_meminfo_field_kb_reads_values() {
+        let raw = "MemTotal:       16384000 kB\nMemAvailable:    8000000 kB\n";
+        assert_eq!(parse_meminfo_field_kb(raw, "MemTotal"), Some(16384000));
+        assert_eq!(parse_meminfo_field_kb(raw, "MemAvailable"), Some(8000000));
+        assert_eq!(parse_meminfo_field_kb(raw, "MemFree"), None);
+    }
+
+    #[test]
+    fn parse_memory_usage_gib_computes_used() {
+        let raw = "MemTotal:       2097152 kB\nMemAvailable:    1048576 kB\n";
+        assert_eq!(parse_memory_usage_gib(raw), Some(1.0));
+    }
+
+    #[test]
+    fn parse_memory_usage_gib_returns_none_when_missing() {
+        let raw = "MemTotal:       2097152 kB\n";
+        assert_eq!(parse_memory_usage_gib(raw), None);
     }
 }
